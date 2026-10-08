@@ -1,0 +1,349 @@
+#include <immintrin.h>
+
+#include <cstdint>
+#include <cstring>
+
+#include "rabitqlib/simd/space_dispatch.hpp"
+
+namespace rabitqlib::simd::excode_ipimpl {
+
+namespace {
+[[nodiscard]] inline uint64_t load_u64(const uint8_t* data) noexcept {
+    uint64_t value = 0;
+    std::memcpy(&value, data, sizeof(value));
+    return value;
+}
+
+[[nodiscard]] inline __m128i set_u64x(uint64_t high, uint64_t low) noexcept {
+    int64_t signed_high = 0;
+    int64_t signed_low = 0;
+    std::memcpy(&signed_high, &high, sizeof(signed_high));
+    std::memcpy(&signed_low, &low, sizeof(signed_low));
+    return _mm_set_epi64x(signed_high, signed_low);
+}
+}  // namespace
+
+// Accumulate the two halves independently to shorten the FMA dependency chain.
+inline void contribute_ip(
+    __m128i vec, const float* __restrict__ query, __m256& sum, __m256& sum_hi
+) {
+    __m256 q = _mm256_loadu_ps(query);
+    __m256 cf = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(vec));
+    sum = _mm256_fmadd_ps(q, cf, sum);
+
+    q = _mm256_loadu_ps(query + 8);
+    cf = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(vec, 8)));
+    sum_hi = _mm256_fmadd_ps(q, cf, sum_hi);
+};
+
+inline void contribute_ip_signed(
+    __m128i vec, const float* __restrict__ query, __m256& sum, __m256& sum_hi
+) {
+    __m256 q = _mm256_loadu_ps(query);
+    __m256 cf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vec));
+    sum = _mm256_fmadd_ps(cf, q, sum);
+
+    q = _mm256_loadu_ps(query + 8);
+    cf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(vec, 8)));
+    sum_hi = _mm256_fmadd_ps(cf, q, sum_hi);
+};
+
+// Reduce in a tree rather than serially adding eight scalar lanes.
+inline float mm256_reduce_add_ps(__m256 v) {
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+    h = _mm_add_ss(h, _mm_movehdup_ps(h));
+    return _mm_cvtss_f32(h);
+}
+
+// ip16: this function is used to compute inner product of
+// vectors padded to multiple of 16
+// fxu1: the inner product is computed between float and 1-bit unsigned int (lay out can be
+// found rabitq_impl.hpp)
+// avx512: only applicable for avx512
+float ip16_fxu1_avx2(
+    const float* __restrict__ query, const uint8_t* __restrict__ compact_code, size_t dim
+) {
+    float result = 0;
+    __m256 sum = _mm256_setzero_ps();
+
+    const __m256i bitmask = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+
+    for (size_t i = 0; i < dim; i += 8) {
+        __m256 q = _mm256_loadu_ps(query);
+
+        __m256i byte_v = _mm256_set1_epi32(*compact_code);
+        __m256i isolated = _mm256_and_si256(byte_v, bitmask);
+        __m256i mask = _mm256_cmpeq_epi32(isolated, bitmask);
+        __m256 masked = _mm256_and_ps(q, _mm256_castsi256_ps(mask));
+
+        sum = _mm256_add_ps(sum, masked);
+        query += 8;
+        ++compact_code;
+    }
+    result = mm256_reduce_add_ps(sum);
+
+    return result;
+}
+
+float ip64_fxu2_avx2(
+    const float* __restrict__ query, const uint8_t* __restrict__ compact_code, size_t dim
+) {
+    __m256 sum0 = _mm256_setzero_ps(), sum1 = sum0, sum2 = sum0, sum3 = sum0;
+
+    float result = 0;
+    const __m128i mask = _mm_set1_epi8(0b00000011);
+
+    for (size_t i = 0; i < dim; i += 64) {
+        __m128i compact = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
+
+        __m128i vec_00_to_15 = _mm_and_si128(compact, mask);
+        __m128i vec_16_to_31 = _mm_and_si128(_mm_srli_epi16(compact, 2), mask);
+        __m128i vec_32_to_47 = _mm_and_si128(_mm_srli_epi16(compact, 4), mask);
+        __m128i vec_48_to_63 = _mm_and_si128(_mm_srli_epi16(compact, 6), mask);
+        contribute_ip(vec_00_to_15, &query[i], sum0, sum1);
+        contribute_ip(vec_16_to_31, &query[i + 16], sum2, sum3);
+        contribute_ip(vec_32_to_47, &query[i + 32], sum0, sum1);
+        contribute_ip(vec_48_to_63, &query[i + 48], sum2, sum3);
+
+        compact_code += 16;
+    }
+
+    result = mm256_reduce_add_ps(
+        _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3))
+    );
+
+    return result;
+}
+
+float ip64_fxu3_avx2(
+    const float* __restrict__ query, const uint8_t* __restrict__ compact_code, size_t dim
+) {
+    __m256 sum0 = _mm256_setzero_ps(), sum1 = sum0, sum2 = sum0, sum3 = sum0;
+
+    float result = 0;
+    const __m128i mask = _mm_set1_epi8(0b11);
+    const __m128i top_mask = _mm_set1_epi8(0b100);
+
+    for (size_t i = 0; i < dim; i += 64) {
+        __m128i compact2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
+        compact_code += 16;
+
+        const uint64_t top_bit = load_u64(compact_code);
+        compact_code += 8;
+
+        __m128i vec_00_to_15 = _mm_and_si128(compact2, mask);
+        __m128i vec_16_to_31 = _mm_and_si128(_mm_srli_epi16(compact2, 2), mask);
+        __m128i vec_32_to_47 = _mm_and_si128(_mm_srli_epi16(compact2, 4), mask);
+        __m128i vec_48_to_63 = _mm_and_si128(_mm_srli_epi16(compact2, 6), mask);
+
+        __m128i top_00_to_15 =
+            _mm_and_si128(set_u64x(top_bit << 1, top_bit << 2), top_mask);
+        __m128i top_16_to_31 =
+            _mm_and_si128(set_u64x(top_bit >> 1, top_bit >> 0), top_mask);
+        __m128i top_32_to_47 =
+            _mm_and_si128(set_u64x(top_bit >> 3, top_bit >> 2), top_mask);
+        __m128i top_48_to_63 =
+            _mm_and_si128(set_u64x(top_bit >> 5, top_bit >> 4), top_mask);
+
+        vec_00_to_15 = _mm_or_si128(top_00_to_15, vec_00_to_15);
+        vec_16_to_31 = _mm_or_si128(top_16_to_31, vec_16_to_31);
+        vec_32_to_47 = _mm_or_si128(top_32_to_47, vec_32_to_47);
+        vec_48_to_63 = _mm_or_si128(top_48_to_63, vec_48_to_63);
+        contribute_ip(vec_00_to_15, &query[i], sum0, sum1);
+        contribute_ip(vec_16_to_31, &query[i + 16], sum2, sum3);
+        contribute_ip(vec_32_to_47, &query[i + 32], sum0, sum1);
+        contribute_ip(vec_48_to_63, &query[i + 48], sum2, sum3);
+    }
+
+    result = mm256_reduce_add_ps(
+        _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3))
+    );
+
+    return result;
+}
+
+float ip16_fxu4_avx2(
+    const float* __restrict__ query, const uint8_t* __restrict__ compact_code, size_t dim
+) {
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+
+    float result = 0.0F;
+    constexpr int64_t kMask = 0x0f0f0f0f0f0f0f0f;
+    for (size_t i = 0; i < dim; i += 16) {
+        int64_t compact;
+        std::memcpy(&compact, compact_code, sizeof(compact));
+        int64_t code0 = compact & kMask;
+        int64_t code1 = (compact >> 4) & kMask;
+
+        __m128i c8 = _mm_set_epi64x(code1, code0);
+        contribute_ip_signed(c8, &query[i], sum0, sum1);
+
+        compact_code += 8;
+    }
+    result = mm256_reduce_add_ps(_mm256_add_ps(sum0, sum1));
+
+    return result;
+}
+
+float ip64_fxu5_avx2(
+    const float* __restrict__ query, const uint8_t* __restrict__ compact_code, size_t dim
+) {
+    __m256 sum0 = _mm256_setzero_ps(), sum1 = sum0, sum2 = sum0, sum3 = sum0;
+
+    float result = 0.0F;
+    const __m128i mask = _mm_set1_epi8(0b1111);
+    const __m128i top_mask = _mm_set1_epi8(0b10000);
+
+    for (size_t i = 0; i < dim; i += 64) {
+        __m128i compact4_1 =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
+        __m128i compact4_2 =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + 16));
+        compact_code += 32;
+
+        const uint64_t top_bit = load_u64(compact_code);
+        compact_code += 8;
+
+        __m128i vec_00_to_15 = _mm_and_si128(compact4_1, mask);
+        __m128i vec_16_to_31 = _mm_and_si128(_mm_srli_epi16(compact4_1, 4), mask);
+        __m128i vec_32_to_47 = _mm_and_si128(compact4_2, mask);
+        __m128i vec_48_to_63 = _mm_and_si128(_mm_srli_epi16(compact4_2, 4), mask);
+
+        __m128i top_00_to_15 =
+            _mm_and_si128(set_u64x(top_bit << 3, top_bit << 4), top_mask);
+        __m128i top_16_to_31 =
+            _mm_and_si128(set_u64x(top_bit << 1, top_bit << 2), top_mask);
+        __m128i top_32_to_47 =
+            _mm_and_si128(set_u64x(top_bit >> 1, top_bit >> 0), top_mask);
+        __m128i top_48_to_63 =
+            _mm_and_si128(set_u64x(top_bit >> 3, top_bit >> 2), top_mask);
+
+        vec_00_to_15 = _mm_or_si128(top_00_to_15, vec_00_to_15);
+        vec_16_to_31 = _mm_or_si128(top_16_to_31, vec_16_to_31);
+        vec_32_to_47 = _mm_or_si128(top_32_to_47, vec_32_to_47);
+        vec_48_to_63 = _mm_or_si128(top_48_to_63, vec_48_to_63);
+
+        contribute_ip(vec_00_to_15, &query[i], sum0, sum1);
+        contribute_ip(vec_16_to_31, &query[i + 16], sum2, sum3);
+        contribute_ip(vec_32_to_47, &query[i + 32], sum0, sum1);
+        contribute_ip(vec_48_to_63, &query[i + 48], sum2, sum3);
+    }
+    result = mm256_reduce_add_ps(
+        _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3))
+    );
+
+    return result;
+}
+
+float ip64_fxu6_avx2(
+    const float* __restrict__ query, const uint8_t* __restrict__ compact_code, size_t dim
+) {
+    __m256 sum0 = _mm256_setzero_ps(), sum1 = sum0, sum2 = sum0, sum3 = sum0;
+
+    float result = 0.0F;
+    const __m128i mask6 = _mm_set1_epi8(0b00111111);
+    const __m128i mask2 = _mm_set1_epi8(static_cast<char>(0b11000000));
+
+    for (size_t i = 0; i < dim; i += 64) {
+        __m128i cpt1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
+        __m128i cpt2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + 16));
+        __m128i cpt3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + 32));
+
+        compact_code += 48;
+
+        __m128i vec_00_to_15 = _mm_and_si128(cpt1, mask6);
+        __m128i vec_16_to_31 = _mm_and_si128(cpt2, mask6);
+        __m128i vec_32_to_47 = _mm_and_si128(cpt3, mask6);
+        __m128i vec_48_to_63 = _mm_or_si128(
+            _mm_or_si128(
+                _mm_srli_epi16(_mm_and_si128(cpt1, mask2), 6),
+                _mm_srli_epi16(_mm_and_si128(cpt2, mask2), 4)
+            ),
+            _mm_srli_epi16(_mm_and_si128(cpt3, mask2), 2)
+        );
+
+        contribute_ip(vec_00_to_15, &query[i], sum0, sum1);
+        contribute_ip(vec_16_to_31, &query[i + 16], sum2, sum3);
+        contribute_ip(vec_32_to_47, &query[i + 32], sum0, sum1);
+        contribute_ip(vec_48_to_63, &query[i + 48], sum2, sum3);
+    }
+    result = mm256_reduce_add_ps(
+        _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3))
+    );
+
+    return result;
+}
+
+float ip64_fxu7_avx2(
+    const float* __restrict__ query, const uint8_t* __restrict__ compact_code, size_t dim
+) {
+    __m256 sum0 = _mm256_setzero_ps(), sum1 = sum0, sum2 = sum0, sum3 = sum0;
+
+    float result = 0.0F;
+    const __m128i mask6 = _mm_set1_epi8(0b00111111);
+    const __m128i mask2 = _mm_set1_epi8(static_cast<char>(0b11000000));
+    const __m128i top_mask = _mm_set1_epi8(0b1000000);
+
+    for (size_t i = 0; i < dim; i += 64) {
+        __m128i cpt1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code));
+        __m128i cpt2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + 16));
+        __m128i cpt3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(compact_code + 32));
+        compact_code += 48;
+
+        __m128i vec_00_to_15 = _mm_and_si128(cpt1, mask6);
+        __m128i vec_16_to_31 = _mm_and_si128(cpt2, mask6);
+        __m128i vec_32_to_47 = _mm_and_si128(cpt3, mask6);
+        __m128i vec_48_to_63 = _mm_or_si128(
+            _mm_or_si128(
+                _mm_srli_epi16(_mm_and_si128(cpt1, mask2), 6),
+                _mm_srli_epi16(_mm_and_si128(cpt2, mask2), 4)
+            ),
+            _mm_srli_epi16(_mm_and_si128(cpt3, mask2), 2)
+        );
+
+        const uint64_t top_bit = load_u64(compact_code);
+        compact_code += 8;
+
+        __m128i top_00_to_15 =
+            _mm_and_si128(set_u64x(top_bit << 5, top_bit << 6), top_mask);
+        __m128i top_16_to_31 =
+            _mm_and_si128(set_u64x(top_bit << 3, top_bit << 4), top_mask);
+        __m128i top_32_to_47 =
+            _mm_and_si128(set_u64x(top_bit << 1, top_bit << 2), top_mask);
+        __m128i top_48_to_63 =
+            _mm_and_si128(set_u64x(top_bit >> 1, top_bit << 0), top_mask);
+
+        vec_00_to_15 = _mm_or_si128(top_00_to_15, vec_00_to_15);
+        vec_16_to_31 = _mm_or_si128(top_16_to_31, vec_16_to_31);
+        vec_32_to_47 = _mm_or_si128(top_32_to_47, vec_32_to_47);
+        vec_48_to_63 = _mm_or_si128(top_48_to_63, vec_48_to_63);
+
+        contribute_ip(vec_00_to_15, &query[i], sum0, sum1);
+        contribute_ip(vec_16_to_31, &query[i + 16], sum2, sum3);
+        contribute_ip(vec_32_to_47, &query[i + 32], sum0, sum1);
+        contribute_ip(vec_48_to_63, &query[i + 48], sum2, sum3);
+    }
+
+    result = mm256_reduce_add_ps(
+        _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3))
+    );
+
+    return result;
+}
+
+float ip16_fxu8_avx2(
+    const float* __restrict__ query, const uint8_t* __restrict__ code, size_t dim
+) {
+    __m256 sum0 = _mm256_setzero_ps();
+    __m256 sum1 = _mm256_setzero_ps();
+    for (size_t i = 0; i < dim; i += 16) {
+        __m128i c8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(code));
+        contribute_ip(c8, &query[i], sum0, sum1);
+        code += 16;
+    }
+    return mm256_reduce_add_ps(_mm256_add_ps(sum0, sum1));
+}
+
+}  // namespace rabitqlib::simd::excode_ipimpl

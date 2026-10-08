@@ -1,0 +1,238 @@
+#include <pybind11/cast.h>
+#include <pybind11/numpy.h>
+#include <pybind11/pybind11.h>
+#include <pybind11/pytypes.h>
+#include <sys/types.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "bindings_common.hpp"
+#include "rabitqlib/defines.hpp"
+#include "rabitqlib/fastscan/fastscan.hpp"
+#include "rabitqlib/index/symqg/qg.hpp"
+#include "rabitqlib/index/symqg/qg_builder.hpp"
+#include "rabitqlib/utils/rotator.hpp"
+
+namespace py = pybind11;
+
+namespace rabitqlib::python_bindings {
+
+class SymqgIndex {
+   public:
+    SymqgIndex(
+        size_t dim,
+        size_t max_degree,
+        const std::string& metric = "l2",
+        size_t quantization_bits = 0
+    )
+        : dim_(dim)
+        , max_degree_(max_degree)
+        , metric_(metric_from_string(metric))
+        , quantization_bits_(quantization_bits) {
+        if (max_degree == 0 || max_degree % rabitqlib::fastscan::kBatchSize != 0) {
+            throw std::invalid_argument("max_degree must be a positive multiple of 32");
+        }
+        if (quantization_bits != 0 && quantization_bits != 4 && quantization_bits != 8) {
+            throw std::invalid_argument("quantization_bits must be 0, 4, or 8");
+        }
+    }
+
+    void build(
+        py::handle data,
+        size_t ef_construction,
+        size_t num_threads = 1,
+        const std::string& init = "pipnn"
+    ) {
+        if (init != "random" && init != "pipnn") {
+            throw std::invalid_argument("init must be 'random' or 'pipnn'");
+        }
+        if (ef_construction == 0 ||
+            ef_construction > std::numeric_limits<uint32_t>::max()) {
+            throw std::invalid_argument("ef_construction must be positive and fit uint32");
+        }
+        auto data_array = ensure_2d_array<float>(data, "data");
+        if (static_cast<size_t>(data_array.shape(1)) != dim_) {
+            throw std::invalid_argument("data dimension does not match index dim");
+        }
+
+        num_points_ = static_cast<size_t>(data_array.shape(0));
+        index_ = std::make_unique<rabitqlib::symqg::QuantizedGraph<float>>(
+            num_points_,
+            dim_,
+            max_degree_,
+            metric_,
+            rabitqlib::RotatorType::FhtKacRotator,
+            quantization_bits_
+        );
+
+        const auto initialization = init == "pipnn" ? symqg::QGInitialization::PiPNN
+                                                    : symqg::QGInitialization::Random;
+        symqg::QGBuilder builder(
+            *index_,
+            static_cast<uint32_t>(ef_construction),
+            data_array.data(),
+            num_threads,
+            initialization
+        );
+        builder.build();
+        built_ = true;
+    }
+
+    py::tuple search(py::handle queries, size_t k, size_t ef, size_t num_threads = 1) {
+        auto query_array = ensure_2d_array<float>(queries, "queries");
+        if (!built_) {
+            throw std::runtime_error("SymqgIndex must be built or loaded before search");
+        }
+        if (k == 0 || k > num_points_) {
+            throw std::invalid_argument("k must be between 1 and num_points");
+        }
+        if (ef == 0) {
+            throw std::invalid_argument("ef must be positive");
+        }
+        if (ef < k) {
+            throw std::invalid_argument("ef must be at least k");
+        }
+        if (static_cast<size_t>(query_array.shape(1)) != dim_) {
+            throw std::invalid_argument("query dimension does not match index dim");
+        }
+
+        index_->set_ef(ef);
+
+        const size_t nq = static_cast<size_t>(query_array.shape(0));
+        const auto shape =
+            std::vector<ssize_t>{static_cast<ssize_t>(nq), static_cast<ssize_t>(k)};
+        auto ids = py::array_t<rabitqlib::PID>(shape);
+        auto dists = py::array_t<float>(shape);
+        auto* ids_data = ids.mutable_data();
+        auto* dists_data = dists.mutable_data();
+
+        const auto* queries_data = query_array.data();
+        const size_t requested_threads =
+            num_threads == 0 ? std::thread::hardware_concurrency() : num_threads;
+        const auto workers = static_cast<int>(std::max<size_t>(
+            1,
+            std::min(
+                {requested_threads,
+                 nq,
+                 static_cast<size_t>(std::numeric_limits<int>::max())}
+            )
+        ));
+        std::atomic<bool> failed{false};
+        std::exception_ptr error;
+#pragma omp parallel for num_threads(workers) if (workers > 1) schedule(dynamic)
+        for (size_t idx = 0; idx < nq; ++idx) {
+            if (failed.load(std::memory_order_relaxed)) {
+                continue;
+            }
+            try {
+                index_->search(
+                    queries_data + (idx * dim_),
+                    static_cast<uint32_t>(k),
+                    ids_data + (idx * k),
+                    dists_data + (idx * k)
+                );
+            } catch (...) {
+#pragma omp critical(rabitq_symqg_search_error)
+                {
+                    if (!error) {
+                        error = std::current_exception();
+                    }
+                }
+                failed.store(true, std::memory_order_relaxed);
+            }
+        }
+        if (error) {
+            std::rethrow_exception(error);
+        }
+
+        return py::make_tuple(ids, dists);
+    }
+
+    void save(const std::string& path) const {
+        if (!built_) {
+            throw std::runtime_error("SymqgIndex must be built before save");
+        }
+        index_->save(path.c_str());
+    }
+
+    static SymqgIndex load(const std::string& path) {
+        SymqgIndex wrapper;
+        wrapper.index_ = std::make_unique<rabitqlib::symqg::QuantizedGraph<float>>();
+        wrapper.index_->load(path.c_str());
+        wrapper.num_points_ = wrapper.index_->num_vertices();
+        wrapper.dim_ = wrapper.index_->dimension();
+        wrapper.max_degree_ = wrapper.index_->degree_bound();
+        wrapper.metric_ = wrapper.index_->metric_type();
+        wrapper.quantization_bits_ = wrapper.index_->quantization_bits();
+        wrapper.built_ = true;
+        return wrapper;
+    }
+
+    [[nodiscard]] size_t dim() const { return dim_; }
+    [[nodiscard]] size_t max_degree() const { return max_degree_; }
+    [[nodiscard]] size_t num_points() const { return num_points_; }
+    [[nodiscard]] bool is_built() const { return built_; }
+    [[nodiscard]] std::string metric() const { return metric_to_string(metric_); }
+    [[nodiscard]] size_t quantization_bits() const { return quantization_bits_; }
+
+   private:
+    SymqgIndex() = default;
+
+    size_t dim_ = 0;
+    size_t max_degree_ = 0;
+    size_t num_points_ = 0;
+    rabitqlib::MetricType metric_ = rabitqlib::METRIC_L2;
+    size_t quantization_bits_ = 0;
+    bool built_ = false;
+    std::unique_ptr<rabitqlib::symqg::QuantizedGraph<float>> index_;
+};
+
+}  // namespace rabitqlib::python_bindings
+
+// Register Symqg bindings into combined module
+void register_symqg(py::module_& m) {
+    using namespace rabitqlib::python_bindings;
+
+    py::class_<SymqgIndex>(m, "SymqgIndex")
+        .def(
+            py::init<size_t, size_t, const std::string&, size_t>(),
+            py::arg("dim"),
+            py::arg("max_degree"),
+            py::arg("metric") = "l2",
+            py::arg("quantization_bits") = 0
+        )
+        .def(
+            "build",
+            &SymqgIndex::build,
+            py::arg("data"),
+            py::arg("ef_construction"),
+            py::arg("num_threads") = 1,
+            py::arg("init") = "pipnn"
+        )
+        .def(
+            "search",
+            &SymqgIndex::search,
+            py::arg("queries"),
+            py::arg("k"),
+            py::arg("ef"),
+            py::arg("num_threads") = 1
+        )
+        .def("save", &SymqgIndex::save, py::arg("path"))
+        .def_static("load", &SymqgIndex::load, py::arg("path"))
+        .def_property_readonly("dim", &SymqgIndex::dim)
+        .def_property_readonly("max_degree", &SymqgIndex::max_degree)
+        .def_property_readonly("num_points", &SymqgIndex::num_points)
+        .def_property_readonly("is_built", &SymqgIndex::is_built)
+        .def_property_readonly("metric", &SymqgIndex::metric)
+        .def_property_readonly("quantization_bits", &SymqgIndex::quantization_bits);
+}

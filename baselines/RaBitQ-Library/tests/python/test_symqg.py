@@ -1,0 +1,266 @@
+"""Tests for SymqgIndex: construction, search, properties, error handling, save/load."""
+
+import os
+import struct
+
+import numpy as np
+import pytest
+from conftest import DIM, N_QUERIES, N_VECTORS, brute_force_knn, recall_at_k
+from rabitqlib import SymqgIndex
+
+_TOPK = 10
+_EF = 50
+_MAX_DEGREE = 32  # must be a multiple of fastscan::kBatchSize (32)
+_EF_BUILD = 50
+
+
+# ── fixtures ──────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture(scope="module")
+def built_symqg(base_data):
+    idx = SymqgIndex(DIM, max_degree=_MAX_DEGREE)
+    idx.build(base_data, ef_construction=_EF_BUILD)
+    return idx
+
+
+# ── construction ──────────────────────────────────────────────────────────────
+
+
+def test_is_built(built_symqg):
+    assert built_symqg.is_built
+
+
+def test_properties(built_symqg):
+    assert built_symqg.dim == DIM
+    assert built_symqg.max_degree == _MAX_DEGREE
+    assert built_symqg.num_points == N_VECTORS
+    assert built_symqg.metric == "l2"
+    assert built_symqg.quantization_bits == 0
+
+
+# ── search output shape and dtype ─────────────────────────────────────────────
+
+
+def test_search_output_shape(built_symqg, query_data):
+    ids, dists = built_symqg.search(query_data, k=_TOPK, ef=_EF)
+    assert ids.shape == (N_QUERIES, _TOPK)
+    assert dists.shape == (N_QUERIES, _TOPK)
+
+
+def test_search_output_dtype(built_symqg, query_data):
+    ids, dists = built_symqg.search(query_data, k=_TOPK, ef=_EF)
+    assert np.issubdtype(ids.dtype, np.integer)
+    assert dists.dtype == np.float32
+
+
+def test_search_ids_in_range(built_symqg, query_data):
+    ids, _ = built_symqg.search(query_data, k=_TOPK, ef=_EF)
+    assert np.all(ids < N_VECTORS)
+
+
+def test_search_distances_nonneg(built_symqg, query_data):
+    _, dists = built_symqg.search(query_data, k=_TOPK, ef=_EF)
+    assert np.all(dists >= 0)
+
+
+def test_single_query(built_symqg, query_data):
+    ids, dists = built_symqg.search(query_data[:1], k=1, ef=_EF)
+    assert ids.shape == (1, 1)
+
+
+# ── search correctness ────────────────────────────────────────────────────────
+
+
+def test_self_retrieval(built_symqg, base_data):
+    """Each database vector must be its own nearest neighbor at high ef."""
+    probes = base_data[:10]
+    ids, _ = built_symqg.search(probes, k=1, ef=200)
+    for i in range(10):
+        assert i in ids[i], f"Vector {i} not found in its own top-1 result"
+
+
+def test_recall_vs_brute_force(built_symqg, base_data, query_data):
+    """Approximate recall should exceed 0.5 at ef=50 on a small dataset."""
+    k = 5
+    approx_ids, _ = built_symqg.search(query_data, k=k, ef=_EF)
+    exact_ids, _ = brute_force_knn(base_data, query_data, k)
+    r = recall_at_k(approx_ids, exact_ids, k)
+    assert r >= 0.5, f"Recall {r:.3f} too low"
+
+
+# ── error handling ────────────────────────────────────────────────────────────
+
+
+def test_wrong_data_dim_raises():
+    idx = SymqgIndex(DIM, max_degree=_MAX_DEGREE)
+    bad_data = np.zeros((N_VECTORS, DIM + 1), dtype=np.float32)
+    with pytest.raises(Exception):
+        idx.build(bad_data, ef_construction=_EF_BUILD)
+
+
+def test_wrong_query_dim_raises(built_symqg):
+    bad_queries = np.zeros((5, DIM + 1), dtype=np.float32)
+    with pytest.raises(Exception):
+        built_symqg.search(bad_queries, k=1, ef=_EF)
+
+
+def test_search_before_build_raises():
+    idx = SymqgIndex(DIM, max_degree=_MAX_DEGREE)
+    queries = np.zeros((5, DIM), dtype=np.float32)
+    with pytest.raises(Exception):
+        idx.search(queries, k=1, ef=_EF)
+
+
+def test_search_rejects_ef_smaller_than_k(built_symqg, query_data):
+    with pytest.raises(ValueError, match="ef must be at least k"):
+        built_symqg.search(query_data, k=10, ef=9)
+
+
+def test_invalid_degree_raises():
+    with pytest.raises(Exception):
+        SymqgIndex(DIM, max_degree=16)
+
+
+def test_invalid_quantization_bits_raises():
+    with pytest.raises(Exception):
+        SymqgIndex(DIM, max_degree=_MAX_DEGREE, quantization_bits=6)
+
+
+def test_save_propagates_write_failure(built_symqg):
+    if not os.path.exists("/dev/full"):
+        pytest.skip("requires a failing output device")
+    with pytest.raises(RuntimeError):
+        built_symqg.save("/dev/full")
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_qg_quant_build_search_and_roundtrip(bits, base_data, query_data, tmp_path):
+    idx = SymqgIndex(DIM, max_degree=_MAX_DEGREE, quantization_bits=bits)
+    idx.build(base_data, ef_construction=_EF_BUILD)
+    assert idx.quantization_bits == bits
+
+    ids, dists = idx.search(query_data, k=5, ef=_EF)
+    assert np.all(ids < N_VECTORS)
+    assert np.all(np.isfinite(dists))
+
+    path = str(tmp_path / f"symqg_quant{bits}.index")
+    idx.save(path)
+    loaded = SymqgIndex.load(path)
+    assert loaded.quantization_bits == bits
+    loaded_ids, loaded_dists = loaded.search(query_data, k=5, ef=_EF)
+    np.testing.assert_array_equal(loaded_ids, ids)
+    np.testing.assert_allclose(loaded_dists, dists, rtol=1e-5)
+
+
+# ── save / load roundtrip ─────────────────────────────────────────────────────
+
+
+def test_save_load_roundtrip(built_symqg, query_data, tmp_path):
+    path = str(tmp_path / "symqg.index")
+    built_symqg.save(path)
+
+    loaded = SymqgIndex.load(path)
+    assert loaded.is_built
+    assert loaded.dim == built_symqg.dim
+    assert loaded.max_degree == built_symqg.max_degree
+    assert loaded.num_points == built_symqg.num_points
+
+    ids_orig, dists_orig = built_symqg.search(query_data, k=_TOPK, ef=_EF)
+    ids_load, dists_load = loaded.search(query_data, k=_TOPK, ef=_EF)
+    np.testing.assert_array_equal(ids_orig, ids_load)
+    np.testing.assert_allclose(dists_orig, dists_load, rtol=1e-5)
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("metric", ["l2", "ip"])
+def test_code_only_build_preserves_v1_format(bits, metric, tmp_path):
+    rng = np.random.default_rng(851)
+    data = rng.normal(size=(65, 65)).astype(np.float32)
+    queries = rng.normal(size=(3, 65)).astype(np.float32)
+    index = SymqgIndex(65, max_degree=32, metric=metric, quantization_bits=bits)
+    index.build(data, ef_construction=64)
+    data.fill(np.nan)
+    path = tmp_path / "code_only.index"
+    index.save(str(path))
+    payload = path.read_bytes()
+    assert struct.unpack_from("<QI", payload) == (0x5147524142495451, 1)
+    # Existing v1 header, centroid, ExDataMap row, neighbor batches/IDs, FHT state.
+    row_bytes = 128 * bits // 8 + 8 + 128 * 4 + 256 + 128
+    assert len(payload) == 58 + 128 * 4 + 65 * row_bytes + 128 // 2
+    ids, distances = index.search(queries, 10, 64)
+    assert np.isfinite(distances).all()
+    assert all(len(set(row)) == 10 for row in ids)
+    loaded = SymqgIndex.load(str(path))
+    loaded_ids, loaded_distances = loaded.search(queries, 10, 64)
+    np.testing.assert_array_equal(loaded_ids, ids)
+    np.testing.assert_array_equal(loaded_distances, distances)
+
+
+@pytest.mark.parametrize("metric", ["l2", "ip"])
+def test_constant_vectors_preserve_returned_distance(metric, tmp_path):
+    """Neighbor corrections must not shift the vertex distances returned to Python."""
+    data = np.full((65, 64), 0.125, dtype=np.float32)
+    queries = np.full((2, 64), 0.0625, dtype=np.float32)
+    index = SymqgIndex(64, max_degree=32, metric=metric)
+    index.build(data, ef_construction=64)
+    ids, distances = index.search(queries, k=5, ef=64)
+    expected = 0.5 if metric == "ip" else 0.25
+    np.testing.assert_allclose(distances, expected, rtol=0, atol=1e-6)
+    assert np.all(ids < len(data))
+    path = str(tmp_path / "constant.symqg")
+    index.save(path)
+    loaded_ids, loaded_distances = SymqgIndex.load(path).search(queries, k=5, ef=64)
+    np.testing.assert_array_equal(loaded_ids, ids)
+    np.testing.assert_allclose(loaded_distances, expected, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("bits", [0, 4, 8])
+@pytest.mark.parametrize("metric", ["l2", "ip"])
+@pytest.mark.parametrize("init", [None, "pipnn", "random"])
+def test_initialization_and_roundtrip(tmp_path, bits, metric, init):
+    rng = np.random.default_rng(17)
+    data = rng.standard_normal((160, 65)).astype(np.float32)
+    queries = rng.standard_normal((8, 65)).astype(np.float32)
+    index = SymqgIndex(65, max_degree=32, metric=metric, quantization_bits=bits)
+    kwargs = {} if init is None else {"init": init}
+    index.build(data, ef_construction=128, num_threads=2, **kwargs)
+    assert index.is_built
+    ids, distances = index.search(queries, k=10, ef=160, num_threads=2)
+    assert np.all(ids < len(data))
+    assert np.isfinite(distances).all()
+    assert all(len(set(row)) == 10 for row in ids)
+    exact = (
+        brute_force_knn(data, queries, 10)[0]
+        if metric == "l2"
+        else np.argsort(-(queries @ data.T), axis=1)[:, :10]
+    )
+    assert recall_at_k(ids, exact, 10) >= (0.7 if bits else 0.95)
+    if bits == 0:
+        expected = (
+            np.sum((queries[:, None, :] - data[ids]) ** 2, axis=2)
+            if metric == "l2"
+            else 1 - np.einsum("qd,qkd->qk", queries, data[ids])
+        )
+        np.testing.assert_allclose(distances, expected, rtol=1e-5, atol=1e-5)
+    path = str(tmp_path / "native_pipnn.index")
+    index.save(path)
+    restored = SymqgIndex.load(path)
+    restored_ids, restored_distances = restored.search(queries, k=10, ef=160)
+    np.testing.assert_array_equal(ids, restored_ids)
+    np.testing.assert_array_equal(distances, restored_distances)
+
+
+def test_native_pipnn_rejects_invalid_build_arguments(base_data):
+    index = SymqgIndex(DIM, max_degree=32)
+    with pytest.raises(ValueError, match="init must be 'random' or 'pipnn'"):
+        index.build(base_data, ef_construction=64, init="unknown")
+    with pytest.raises(
+        ValueError, match="ef_construction must be positive and fit uint32"
+    ):
+        index.build(base_data, ef_construction=0, init="pipnn")
+
+
+def test_default_initialization_is_pipnn():
+    # pybind11 generates this signature from the actual Python argument defaults.
+    assert "init: str = 'pipnn'" in SymqgIndex.build.__doc__

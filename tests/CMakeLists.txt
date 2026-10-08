@@ -1,0 +1,15 @@
+add_executable(e8q_test unit/e8q_test.cpp)
+target_link_libraries(e8q_test PRIVATE e8q_core)
+e8q_enable_warnings(e8q_test)
+add_test(NAME e8q_test COMMAND e8q_test)
+
+add_executable(me8q_test unit/me8q_test.cpp)
+target_link_libraries(me8q_test PRIVATE e8q_core)
+e8q_enable_warnings(me8q_test)
+add_test(NAME me8q_test COMMAND me8q_test)
+
+add_executable(scan_kernel_test unit/scan_kernel_test.cpp)
+target_link_libraries(scan_kernel_test PRIVATE e8q_core)
+target_include_directories(scan_kernel_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+e8q_enable_warnings(scan_kernel_test)
+add_test(NAME scan_kernel_test COMMAND scan_kernel_test)

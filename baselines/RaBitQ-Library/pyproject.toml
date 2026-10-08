@@ -1,0 +1,57 @@
+[build-system]
+requires = ["scikit-build-core>=0.10.0", "pybind11>=2.12", "numpy"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "rabitqlib"
+version = "0.3.6"
+description = "RaBitQ Python bindings for HNSW, IVF, and SymQG"
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dependencies = ["numpy"]
+
+[project.urls]
+Homepage = "https://vectordb-ntu.github.io/RaBitQ-Library/"
+Documentation = "https://vectordb-ntu.github.io/RaBitQ-Library/"
+Repository = "https://github.com/VectorDB-NTU/RaBitQ-Library"
+Issues = "https://github.com/VectorDB-NTU/RaBitQ-Library/issues"
+Paper = "https://doi.org/10.1145/3725413"
+
+[project.optional-dependencies]
+test = ["pytest>=7", "numpy"]
+
+[tool.scikit-build]
+# Disable directory auto-discovery so we can map it via CMake's install target
+wheel.packages = []
+
+# Pass the toggle to your root CMake file automatically on pip install
+cmake.args = [
+    "-DRABITQ_BUILD_PYTHON_BINDINGS=ON",
+    "-DCMAKE_BUILD_TYPE=Release"
+]
+
+[tool.cibuildwheel]
+build = "cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64 cp314-manylinux_x86_64"
+build-verbosity = 1
+environment = { CMAKE_ARGS = "-DRABITQ_ENABLE_NATIVE_OPTIMIZATION=OFF" }
+test-requires = "pytest"
+test-command = "pytest {project}/tests/python --tb=short -q"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

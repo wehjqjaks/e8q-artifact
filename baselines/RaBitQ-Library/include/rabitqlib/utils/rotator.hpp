@@ -1,0 +1,262 @@
+#pragma once
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <limits>
+#include <random>
+#include <stdexcept>
+#include <type_traits>
+#include <vector>
+
+#include "rabitqlib/defines.hpp"
+#include "rabitqlib/simd/matrix_dispatch.hpp"
+#include "rabitqlib/simd/rotator_dispatch.hpp"
+#include "rabitqlib/utils/space.hpp"
+#include "rabitqlib/utils/tools.hpp"
+
+namespace rabitqlib {
+
+enum class RotatorType : uint8_t { MatrixRotator, FhtKacRotator };
+
+// abstract rotator
+template <typename T>
+class Rotator {
+   protected:
+    size_t dim_;
+    size_t padded_dim_;
+
+   public:
+    explicit Rotator() = default;
+    explicit Rotator(size_t dim, size_t padded_dim) : dim_(dim), padded_dim_(padded_dim){};
+    virtual ~Rotator() = default;
+    virtual void rotate(const T* src, T* dst) const = 0;
+    virtual void load(std::ifstream&) = 0;
+    virtual void save(std::ofstream&) const = 0;
+    // Buffer I/O
+    virtual void load(const char* data) = 0;
+    virtual void save(char* data) const = 0;  // dump to buffer
+    virtual size_t dump_bytes() const = 0;
+    [[nodiscard]] size_t size() const { return this->padded_dim_; }
+};
+
+namespace rotator_impl {
+
+// get padding requirement for different rotator
+inline size_t padding_requirement(size_t dim, RotatorType type) {
+    if (type == RotatorType::MatrixRotator) {
+        return dim;
+    }
+    if (type == RotatorType::FhtKacRotator) {
+        if (dim > std::numeric_limits<size_t>::max() - 63) {
+            throw std::invalid_argument("Rotator dimension is too large to pad");
+        }
+        return round_up_to_multiple(dim, 64);
+    }
+    throw std::invalid_argument("Invalid rotator type in padding_requirement()");
+}
+
+template <typename T = float>
+class MatrixRotator : public Rotator<T> {
+   private:
+    RowMajorMatrix<T> rand_mat_;  // Rotation matrix
+   public:
+    explicit MatrixRotator(size_t dim, size_t padded_dim)
+        : Rotator<T>(dim, padded_dim), rand_mat_(dim, padded_dim) {
+        RowMajorMatrix<T> rand = random_gaussian_matrix<T>(padded_dim, padded_dim);
+        Eigen::HouseholderQR<RowMajorMatrix<T>> qr(rand);
+        RowMajorMatrix<T> q_inv = qr.householderQ().transpose(
+        );  // The inverse of an orthogonal matrix is its transpose.
+
+        // the random matrix only need the first dim rows, since we just pad zeros for
+        // the vector to be rotated to padded dimension
+        std::memcpy(&rand_mat_(0, 0), &q_inv(0, 0), sizeof(T) * dim * padded_dim);
+    }
+    MatrixRotator() = default;
+    ~MatrixRotator() override = default;
+
+    MatrixRotator& operator=(const MatrixRotator& other) {
+        this->dim_ = other.dim_;
+        this->padded_dim_ = other.padded_dim_;
+        this->rand_mat_ = other.rand_mat_;
+        return *this;
+    }
+
+    void load(std::ifstream& input) override {
+        input.read(
+            reinterpret_cast<char*>(rand_mat_.data()),
+            static_cast<long>(sizeof(T) * this->dim_ * this->padded_dim_)
+        );
+    }
+
+    void save(std::ofstream& output) const override {
+        output.write(
+            reinterpret_cast<const char*>(rand_mat_.data()),
+            (sizeof(T) * this->dim_ * this->padded_dim_)
+        );
+    }
+
+    void load(const char* data) override {
+        std::memcpy(rand_mat_.data(), data, sizeof(T) * this->dim_ * this->padded_dim_);
+    }
+
+    void save(char* data) const override {
+        std::memcpy(data, rand_mat_.data(), sizeof(T) * this->dim_ * this->padded_dim_);
+    }
+
+    size_t dump_bytes() const override {
+        return sizeof(T) * this->dim_ * this->padded_dim_;
+    }
+
+    void rotate(const T* vec, T* rotated_vec) const override {
+        if constexpr (std::is_same_v<T, float>) {
+            // Match Eigen's alias-safe assignment: callers may rotate in place.
+            std::vector<float> result(this->padded_dim_);
+            simd::matrix_product(
+                vec, rand_mat_.data(), result.data(), 1, this->dim_, this->padded_dim_
+            );
+            std::copy(result.begin(), result.end(), rotated_vec);
+        } else {
+            ConstRowMajorMatrixMap<T> v(vec, 1, this->dim_);
+            RowMajorMatrixMap<T> rv(rotated_vec, 1, this->padded_dim_);
+            rv = v * this->rand_mat_;
+        }
+    }
+};
+
+static inline void flip_sign(const uint8_t* flip, float* data, size_t dim) {
+    simd::flip_sign(flip, data, dim);
+}
+
+class FhtKacRotator : public Rotator<float> {
+   private:
+    std::vector<uint8_t> flip_;
+    size_t trunc_dim_ = 0;
+    float fac_ = 0;
+
+    static constexpr size_t kByteLen = 8;
+
+   public:
+    explicit FhtKacRotator(size_t dim, size_t padded_dim)
+        : Rotator<float>(dim, padded_dim), flip_(4 * padded_dim / kByteLen) {
+        // [e8qlib vendored patch 2026-09-20] Upstream draws the rotator from
+        // random_device on every construct (recall drifts ~+-0.003 between
+        // runs). For reproducible benchmarking we honor RABITQ_ROTATOR_SEED
+        // (decimal uint64): when set, the flip bytes derive from
+        // mt19937(seed low^high 32 bits) instead. Unset/invalid keeps the
+        // exact upstream behavior. See baselines/CHANGES.md.
+        std::random_device rd;
+        std::seed_seq seed{rd(), rd(), rd(), rd()};
+        std::mt19937 gen(seed);
+        if (const char* env = std::getenv("RABITQ_ROTATOR_SEED")) {
+            char* end = nullptr;
+            const unsigned long long sv = std::strtoull(env, &end, 10);
+            if (end != env && *end == '\0') {
+                gen.seed(static_cast<unsigned int>(sv) ^
+                         static_cast<unsigned int>(sv >> 32));
+            }
+        }
+
+        // Uniform distribution in the range [0, 255]
+        std::uniform_int_distribution<int> dist(0, 255);
+
+        // Generate a single random uint8_t value
+        for (auto& i : flip_) {
+            i = static_cast<uint8_t>(dist(gen));
+        }
+
+        // TODO(lib): is it portable?
+        size_t bottom_log_dim = floor_log2(dim);
+        trunc_dim_ = 1 << bottom_log_dim;
+        fac_ = 1.0F / std::sqrt(static_cast<float>(trunc_dim_));
+
+        if (bottom_log_dim < 6 || bottom_log_dim > 11) {
+            throw std::invalid_argument("Unsupported dimension for FhtKacRotator");
+        }
+    }
+    FhtKacRotator() = default;
+    ~FhtKacRotator() override = default;
+
+    void load(std::ifstream& input) override {
+        input.read(
+            reinterpret_cast<char*>(flip_.data()),
+            static_cast<long>(sizeof(uint8_t) * flip_.size())
+        );
+    }
+
+    void save(std::ofstream& output) const override {
+        output.write(
+            reinterpret_cast<const char*>(flip_.data()),
+            static_cast<long>(sizeof(uint8_t) * flip_.size())
+        );
+    }
+
+    void load(const char* data) override {
+        std::memcpy(flip_.data(), data, sizeof(uint8_t) * flip_.size());
+    }
+
+    void save(char* data) const override {
+        std::memcpy(data, flip_.data(), sizeof(uint8_t) * flip_.size());
+    }
+
+    size_t dump_bytes() const override { return sizeof(uint8_t) * flip_.size(); }
+
+    FhtKacRotator& operator=(const FhtKacRotator& other) {
+        this->dim_ = other.dim_;
+        this->padded_dim_ = other.padded_dim_;
+        this->flip_ = other.flip_;
+        this->trunc_dim_ = other.trunc_dim_;
+        this->fac_ = other.fac_;
+        return *this;
+    }
+
+    static void kacs_walk(float* data, size_t len) { simd::kacs_walk(data, len); }
+
+    void rotate(const float* data, float* rotated_vec) const override {
+        simd::fht_rotate(
+            data, rotated_vec, dim_, padded_dim_, trunc_dim_, fac_, flip_.data()
+        );
+    }
+};
+}  // namespace rotator_impl
+
+// for given dim & type, set rotator, return padded dimension
+template <typename T>
+Rotator<T>* choose_rotator(
+    size_t dim, RotatorType type = RotatorType::FhtKacRotator, size_t padded_dim = 0
+) {
+    if (dim == 0) {
+        throw std::invalid_argument("Rotator dimension must be positive");
+    }
+    if (padded_dim == 0) {
+        padded_dim = rotator_impl::padding_requirement(dim, type);
+    }
+
+    if (padded_dim < dim) {
+        throw std::invalid_argument(
+            "Padded rotator dimension must not be smaller than input"
+        );
+    }
+
+    if (padded_dim != rotator_impl::padding_requirement(padded_dim, type)) {
+        throw std::invalid_argument("Invalid padded dimension for the rotator type");
+    }
+
+    if (type == RotatorType::FhtKacRotator) {
+        if (!std::is_same_v<T, float>) {
+            throw std::invalid_argument("FhtKacRotator only supports float");
+        }
+        return ::new rotator_impl::FhtKacRotator(dim, padded_dim);
+    }
+
+    if (type == RotatorType::MatrixRotator) {
+        return ::new rotator_impl::MatrixRotator<T>(dim, padded_dim);
+    }
+
+    throw std::invalid_argument("Invalid rotator type in choose_rotator()");
+}
+}  // namespace rabitqlib

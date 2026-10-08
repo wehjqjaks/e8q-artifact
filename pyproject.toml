@@ -1,0 +1,45 @@
+[build-system]
+requires = ["scikit-build-core>=0.10.0", "pybind11>=2.12", "numpy"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "e8qlib"
+version = "1.0.0"
+description = "E8 lattice quantization for IVF ANNS: E8Q (fixed-rate) and ME8Q (SAQ + E8Q codec)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "numpy"]
+data = [
+    "huggingface_hub>=0.24",
+    "pyarrow>=14",
+    "faiss-cpu>=1.8",
+]
+plot = ["matplotlib>=3.8", "numpy"]
+
+[tool.scikit-build]
+wheel.packages = []
+cmake.args = [
+    "-DE8Q_BUILD_PYTHON_BINDINGS=ON",
+    "-DE8Q_BUILD_SAMPLES=OFF",
+    "-DE8Q_BUILD_TESTS=OFF",
+    "-DCMAKE_BUILD_TYPE=Release",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
